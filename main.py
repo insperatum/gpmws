@@ -4,10 +4,15 @@ from torch.nn import functional as F
 from torch.distributions.normal import Normal
 import gpytorch
 
-data_xs = torch.Tensor([-4, -2, 0,2,4]).cuda()
-order = 4
-d_phi = order*2
-batch_size=50
+n_history = 50 #How many GP observations to store in memory, per example
+order = 3 #Polynomial order
+
+n_dataset = 100
+data_xs = torch.Tensor([-4, -2, 0,2,4]).cuda() #Evaluate polynomial at these points
+observation_noise = 1
+
+
+d_phi = (order+1)*2
 
 class R(nn.Module):
     def __init__(self):
@@ -29,8 +34,8 @@ class R(nn.Module):
 class Q(nn.Module):
     def __init__(self, phi):
         super().__init__()
-        self.mu = phi[:, :order]
-        self.sigma = F.softplus(phi[:, order:])
+        self.mu = phi[:, :(order+1)]
+        self.sigma = F.softplus(phi[:, (order+1):])
         self.dist = Normal(self.mu, self.sigma)
 
     def forward(self, z = None):
@@ -40,16 +45,16 @@ class Q(nn.Module):
 
 
 class P(nn.Module):
-    def __init__(self):
+    def __init__(self, sigma=1):
         super().__init__()
-        powers = torch.arange(order).float().cuda()
+        powers = torch.arange(order+1).float().cuda()
+        self.sigma=sigma
         self.inputs = data_xs[None, :] ** powers[:, None]
 
     def forward(self, z, x=None):
         coeffs=z
         mu = (coeffs[:, :, None] * self.inputs[None, :, :]).sum(dim=1)
-        sigma = 1
-        dist = Normal(mu, sigma)
+        dist = Normal(mu, self.sigma)
         if x is None: x = dist.sample()
         score = dist.log_prob(x).sum(dim=1)
         return x, score
@@ -69,22 +74,22 @@ class ExactGPModel(gpytorch.models.ExactGP):
         return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
 
 r = R().cuda()
-p = P().cuda()
+p = P(observation_noise).cuda()
 
 #Make Data
-coeffs = torch.randn(200, 4).cuda()
+coeffs = torch.randn(n_dataset, 4).cuda()
 coeffs[0, :3]=0
 coeffs[0, 3]=2
-data, _ = p(coeffs)
+data, _ = P(observation_noise).cuda()(coeffs)
 
 #Make memory
 n_observations = torch.zeros(len(data)).cuda().long()
-n_history = 100
 observation_inputs = torch.zeros(len(data), n_history, d_phi).cuda()
 observation_outputs = torch.zeros(len(data), n_history).cuda()
 best_phi = torch.zeros(len(data), d_phi).cuda()
 
 def getBatch():
+    batch_size=50
     i = torch.randperm(len(data))[:batch_size].cuda()
     return i, data[i]
 
@@ -100,7 +105,8 @@ for iteration in range(2000):
     phi, rscore = r(x)
     q = Q(phi)
     z, qz = q()
-    _, score = p(z, x)
+    _, p_score = p(z, x)
+    score = p_score - qz
 
     obs_idxs = i*n_history + n_observations[i]%n_history
     inputs_unrolled = observation_inputs.view(len(data) * n_history, *observation_inputs.size()[2:])
