@@ -96,6 +96,7 @@ def getBatch():
 optimizer = torch.optim.Adam(
         list(mean_module.parameters()) +
         list(covar_module.parameters()) +
+        list(likelihood.parameters()) +
         list(r.parameters()))
 avg_score = None
 for iteration in range(2000):
