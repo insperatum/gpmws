@@ -1,12 +1,14 @@
+import random
 import torch
 from torch import nn
+from torch.autograd import Variable
 from torch.nn import functional as F
 from torch.distributions.normal import Normal
 #from torch.distributions.cauchy import Cauchy
 #from torch.distributions.studentT import StudentT
 import gpytorch
 
-n_history = 50 #How many GP observations to store in memory, per example
+n_history = 5 #How many GP observations to store in memory, per example
 order = 3 #Polynomial order
 
 n_dataset = 100
@@ -111,6 +113,40 @@ def getBatch():
     i = torch.randperm(len(data))[:batch_size].cuda()
     return i, data[i]
 
+def getGPModel(i):
+    min_n_observations = min(n_history, min(n_observations[i]))
+
+    train_x = observation_inputs[i, :min_n_observations] #b * n * d
+    train_y = observation_outputs[i, :min_n_observations] #b * n
+    model = ExactGPModel(train_x, train_y, likelihood).cuda()
+    return model, train_x, train_y
+
+def getProposalDistribution(i, x):
+    if random.random()<0.5 or any(n_observations[i]==0):
+        # Propose using recognition model
+        phi, _ = r(x)
+        return phi
+    else:
+        # Local proposal
+        model, train_x, train_y = getGPModel(i)
+        model.eval()
+        likelihood.eval()
+        v = Variable(train_x, requires_grad=True)
+        m = model(v).mean
+        best_score, best_idx = torch.max(m, dim=1)
+        v_unrolled = v.data.view(-1, *v.size()[2:])
+        best_phi = v_unrolled[torch.arange(0, len(v_unrolled), v.size(1)).cuda() + best_idx]
+        #m.sum().backward()
+        #grad_unrolled = v.grad.view(-1, *v.size()[2:])
+        #best_grad = grad_unrolled[torch.arange(0, len(v_unrolled), v.size(1)).cuda() + best_idx]
+        lr = 0.01#Variable(torch.Tensor([0.001]).cuda(), requires_grad=True)
+        #step = best_grad*lr
+        mu = best_phi# + step
+        sigma = lr#step.abs()
+        dist = Normal(mu, sigma)
+        return dist.rsample() 
+
+
 optimizer = torch.optim.Adam([
     {'params':mean_module.parameters(), 'lr':1},
     {'params':covar_module.parameters(), 'lr':1},
@@ -124,40 +160,31 @@ for iteration in range(2000):
     optimizer.zero_grad()
 
     i, x = getBatch()
-    phi, rscore = r(x)
+    phi = getProposalDistribution(i, x)
+
+    optimizer.zero_grad()
     q = Q(phi)
     z, qz = q()
     _, pz_score = pz(z)
     _, px_score = px(z, x)
     score = pz_score+px_score - qz
-    if torch.isnan(score).any():
-        print("Got nan!")
-        raise Exception()
-    #    keep_idxs = 1-torch.isnan(score)
-    #    i, x = i[keep_idxs], x[keep_idxs]
-    #    phi, rscore = phi[keep_idxs], rscore[keep_idxs]
-    #    z, qz = z[keep_idxs], qz[keep_idxs]
-    #    p_score = p_score[keep_idxs]
-    #    score = score[keep_idxs]
+    if torch.isnan(score).any(): raise Exception("Score is NaN!")
 
-
+    #Sleep
     #z_sleep, _ = pz()
     #x_sleep, _ = px(z)
     #phi_sleep, _ = r(x_sleep)
     #q_sleep = Q(phi_sleep)
     #_, sleep_score = q_sleep(z_sleep)
-    wake_score = score
-    #r_score, _ = torch.cat([wake_score[None], sleep_score[None]]).max(dim=0)
-    r_score=wake_score
     #r_score = sleep_score
-    (-r_score.mean()).backward(retain_graph=True)
+
+    r_score= score
+    if r_score.requires_grad: (-r_score.mean()).backward(retain_graph=True)
     if any(torch.isnan(param.grad).any() for param in r.parameters()):
         print("NaN in grad, oops!")
         optimizer.zero_grad()
 
 
-    #inputs_unrolled.index_copy_(dim=0, index=obs_idxs, source=phi.data)
-    #outputs_unrolled[obs_idxs] = score.data
     obs_idxs = i*n_history + n_observations[i]%n_history
     inputs_unrolled.index_copy_(dim=0, index=obs_idxs, source=observation_inputs[i, 0])
     outputs_unrolled[obs_idxs] = observation_outputs[i, 0]
@@ -166,36 +193,30 @@ for iteration in range(2000):
     observation_outputs[i, 0] = score.data
     n_observations[i] += 1
 
-    min_n_observations = min(n_history, min(n_observations[i]))
+    model, train_x, train_y = getGPModel(i)
+    model.train()
+    likelihood.train()
+    mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
+    output = model(train_x)
+    gp_score = mll(output, train_y)
+    loss = -gp_score.sum()
+    loss.backward(retain_graph=True)
 
-    if min_n_observations>=2:
-        train_x = observation_inputs[i, :min_n_observations] #b * n * d
-        train_y = observation_outputs[i, :min_n_observations] #b * n
-        model = ExactGPModel(train_x, train_y, likelihood).cuda()
-        
-        model.train()
-        likelihood.train()
-        mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
-        output = model(train_x)
-        gp_score = mll(output, train_y)
-        loss = -gp_score.sum()
-        loss.backward(retain_graph=True)
+    model.eval()
+    likelihood.eval()
+    m = model(train_x).mean
+    best_score, best_idx = torch.max(m, dim=1)
+    best_phi[i] = inputs_unrolled[i*n_history + best_idx] #This is what would train p
+    cur_score   = m[:, 0]
 
-        model.eval()
-        likelihood.eval()
-        m = model(train_x).mean
-        best_score, best_idx = torch.max(m, dim=1)
-        best_phi[i] = inputs_unrolled[i*n_history + best_idx] #This is what would train p
-        cur_score   = m[:, 0]
+    optimizer.step()
 
-        optimizer.step()
-
-        avg_score = score.mean().item() if avg_score is None else 0.9*avg_score + 0.1*score.mean().item() 
-        avg_score_regression = cur_score.mean().item() if avg_score_regression is None else 0.9*avg_score_regression + 0.1*cur_score.mean().item() 
-        avg_best_score = best_score.mean().item() if avg_best_score is None else 0.9*avg_best_score + 0.1*best_score.mean().item() 
-        if iteration%10==0:
-            print("\nIteration", iteration, "score", avg_score, "regression", avg_score_regression, "best", avg_best_score)
-            print("True:", coeffs[0])
-            print("Mean:", Q(best_phi).mu[0])
-            print("Std:", Q(best_phi).sigma[0])
-            print("gp noise", likelihood.noise.item())
+    avg_score = score.mean().item() if avg_score is None else 0.9*avg_score + 0.1*score.mean().item() 
+    avg_score_regression = cur_score.mean().item() if avg_score_regression is None else 0.9*avg_score_regression + 0.1*cur_score.mean().item() 
+    avg_best_score = best_score.mean().item() if avg_best_score is None else 0.9*avg_best_score + 0.1*best_score.mean().item() 
+    if iteration%10==0:
+        print("\nIteration", iteration, "score", avg_score, "regression", avg_score_regression, "best", avg_best_score)
+        print("True:", coeffs[0])
+        print("Mean:", Q(best_phi).mu[0])
+        print("Std:", Q(best_phi).sigma[0])
+        print("gp noise", likelihood.noise.item())
