@@ -58,7 +58,7 @@ class Pz(nn.Module):
 
     def forward(self, z=None):
         if z is None: z = self.dist.rsample()
-        score = self.dist.log_prob(z).sum(dim=1)*0
+        score = self.dist.log_prob(z).sum(dim=1)
         return z, score
 
 class Px(nn.Module):

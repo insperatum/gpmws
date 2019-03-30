@@ -46,7 +46,13 @@ downloads: {}
 #
 packages:
 - pytorch
+- scipy
 - gpytorch
+- pip:
+  - pyro-ppl
+  - contextlib2
+  - graphviz
+  - opt_einsum
 
 #
 # In the channels section, list any Conda channel URLs to be searched
